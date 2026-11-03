@@ -1,0 +1,959 @@
+#!/usr/bin/env python3
+# build.py — biteyt_full v4: working spawn chain + diagnostic
+import os, zipfile
+
+ROOT = "biteyt_full"
+FILES = {}
+
+FILES["requirements.txt"] = """\
+fastapi==0.115.0
+uvicorn==0.30.6
+websockets==13.1
+aiohttp==3.10.5
+"""
+
+FILES["protocol.py"] = r'''\
+"""agar.io protocol — spawn op is 0x00, name is UTF-16LE. That was the bug."""
+import struct
+
+C_PROTOCOL_VERSION = 0x01
+C_SPAWN            = 0x00
+C_UPDATE           = 0x03
+C_PING             = 0x02
+
+class Reader:
+    __slots__ = ("b", "p")
+    def __init__(self, buf): self.b = buf; self.p = 0
+    def u8(self):  v = self.b[self.p]; self.p += 1; return v
+    def u16(self): v = struct.unpack_from("<H", self.b, self.p)[0]; self.p += 2; return v
+    def u32(self): v = struct.unpack_from("<I", self.b, self.p)[0]; self.p += 4; return v
+    def i16(self): v = struct.unpack_from("<h", self.b, self.p)[0]; self.p += 2; return v
+    def i32(self): v = struct.unpack_from("<i", self.b, self.p)[0]; self.p += 4; return v
+    def f32(self): v = struct.unpack_from("<f", self.b, self.p)[0]; self.p += 4; return v
+    def f64(self): v = struct.unpack_from("<d", self.b, self.p)[0]; self.p += 8; return v
+    def str16(self):
+        """UTF-16LE null-terminated string as agar.io uses for nicknames."""
+        start = self.p
+        while True:
+            lo = self.b[self.p]; hi = self.b[self.p+1]
+            self.p += 2
+            if lo == 0 and hi == 0:
+                return self.b[start:self.p-2].decode("utf-16-le", "replace")
+
+def make_version(rev=0):
+    return struct.pack("<BI", C_PROTOCOL_VERSION, rev)
+
+def make_spawn(name: str):
+    """0x00 + UTF-16LE name + 0x0000 terminator. THIS IS THE SPAWN."""
+    out = bytearray([C_SPAWN])
+    out += name.encode("utf-16-le")
+    out += b"\x00\x00"
+    return bytes(out)
+
+def make_update(mx, my, split=0, eject=0, flags=0):
+    """0x03 + int32 mx + int32 my + u8 split + u8 eject + u8 flags."""
+    return struct.pack("<Bii BBB", C_UPDATE, mx, my, split, eject, flags)
+
+def make_ping(ts=0):
+    return struct.pack("<BI", C_PING, ts & 0xFFFFFFFF)
+
+def parse_leaderboard(r):
+    n = r.u32()
+    out = []
+    for _ in range(n):
+        name = r.str16()
+        uid  = r.u32()
+        out.append((uid, name))
+    return out
+
+def op_name(op):
+    return {
+        0x10:"UpdateNodes", 0x14:"ClearAll", 0x15:"ClearMyCells",
+        0x20:"AddNode", 0x31:"UpdatePos", 0x32:"AddMyCell",
+        0x40:"Camera", 0x41:"SetRadius", 0x42:"SetCenter",
+        0x49:"Leaderboard", 0x64:"SetBorder", 0xF0:"SetNickname",
+    }.get(op, f"0x{op:02X}")
+'''
+
+FILES["discovery.py"] = r'''\
+import aiohttp
+
+async def find_server(mode="ffa"):
+    async with aiohttp.ClientSession() as s:
+        async with s.post("https://m.agar.io/findServer", data=f"{mode}\n",
+                          headers={"User-Agent":"Mozilla/5.0"}) as r:
+            text = (await r.text()).strip()
+    parts = text.split("\n")
+    host = parts[0]; key = parts[1] if len(parts) > 1 else ""
+    return f"wss://{host}", key
+
+async def find_server_retry(mode="ffa", tries=3):
+    last = None
+    for _ in range(tries):
+        try: return await find_server(mode)
+        except Exception as e: last = e
+    raise RuntimeError(f"findServer failed: {last}")
+
+async def resolve_uri(source: str):
+    if not source or source == "ffa":
+        return await find_server_retry("ffa")
+    if source.startswith("party:"):
+        from party import party_server
+        return await party_server(source.split(":",1)[1].strip(), "ffa")
+    if source.startswith("ws://") or source.startswith("wss://"):
+        return source, ""
+    raise RuntimeError(f"unknown source: {source}")
+'''
+
+FILES["party.py"] = r'''\
+import aiohttp
+
+async def create_party(mode="ffa"):
+    async with aiohttp.ClientSession() as s:
+        async with s.post("https://m.agar.io/", data=f"party\n{mode}",
+                          headers={"User-Agent":"Mozilla/5.0"}) as r:
+            return (await r.text()).strip()
+
+async def party_server(code, mode="ffa"):
+    payload = "\x00" + code + "\n" + mode
+    async with aiohttp.ClientSession() as s:
+        async with s.post("https://m.agar.io/findServer", data=payload,
+                          headers={"User-Agent":"Mozilla/5.0"}) as r:
+            text = (await r.text()).strip()
+    parts = text.split("\n")
+    host = parts[0]; key = parts[1] if len(parts) > 1 else ""
+    return f"wss://{host}", key
+'''
+
+FILES["agar_client.py"] = r'''\
+import asyncio, time, random
+import websockets
+from protocol import (
+    Reader, make_version, make_spawn, make_update, make_ping,
+    parse_leaderboard, op_name,
+)
+
+class AgarClient:
+    def __init__(self, ws_uri, nickname, proxy=None, auth_token="",
+                 profile_name="aggressive", custom_name="", mimic_name="",
+                 verbose=False):
+        self.ws_uri = ws_uri
+        self.nickname = custom_name or mimic_name or nickname
+        self.mimic_name = mimic_name
+        self.proxy = proxy
+        self.auth_token = auth_token
+        self.profile_name = profile_name
+        self.verbose = verbose
+
+        self.alive = False
+        self.kicked = False
+        self.reconnect_count = 0
+        self.spawn_sent = False
+        self.spawn_confirmed = False
+        self.server_key = ""
+        self.me = None
+        self.nodes = {}
+        self.leaderboard = []
+        self.center = (0.0,0.0); self.radius = 1000.0
+        self.last_ops = []   # ring of recent op codes for diagnostics
+
+        self._ws = None; self._task = None; self._ping_task = None
+        self._last_split=0.0; self._last_eject=0.0
+        self._dead_since=None
+        self._last_update=0.0
+        self._update_jitter = random.uniform(0.060, 0.075)
+        self.tick_hz=0.0; self._tick_count=0; self._tick_window=time.time()
+        self.macro=None
+        self._jitter_side = 1 if hash(nickname) % 2 else -1
+        self._jitter_phase = random.uniform(0.3, 0.9)
+
+    def _headers(self):
+        h = {
+            "Origin": "https://agar.io",
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                          "AppleWebKit/537.36 (KHTML, like Gecko) "
+                          "Chrome/124.0 Safari/537.36",
+            "Accept-Encoding": "gzip, deflate",
+        }
+        if self.auth_token:
+            h["Cookie"] = f"auth_token={self.auth_token}"
+        return h
+
+    async def connect(self):
+        # attach server key as query if present
+        uri = self.ws_uri
+        if self.server_key and "?" not in uri:
+            uri = f"{uri}?key={self.server_key}"
+        self._ws = await websockets.connect(
+            uri, extra_headers=self._headers(), proxy=self.proxy,
+            max_size=2**24, open_timeout=10, ping_interval=None,
+        )
+        await self._ws.send(make_version())
+        await self._ws.send(make_spawn(self.nickname))
+        self.spawn_sent = True
+        self.kicked = False
+        self._task = asyncio.create_task(self._read())
+        self._ping_task = asyncio.create_task(self._ping_loop())
+
+    async def _ping_loop(self):
+        while self._ws:
+            try:
+                await self._ws.send(make_ping(int(time.time()*1000)))
+            except Exception:
+                return
+            await asyncio.sleep(5.0)
+
+    async def _read(self):
+        try:
+            async for msg in self._ws:
+                if not isinstance(msg, bytes) or not msg: continue
+                r = Reader(msg); op = r.u8()
+                self.last_ops.append(op)
+                if len(self.last_ops) > 32: self.last_ops.pop(0)
+                if self.verbose:
+                    print(f"[{self.nickname}] <- {op_name(op)} "
+                          f"({len(msg)}B)")
+
+                if op == 0x32:  # AddMyCell
+                    cid = r.u32()
+                    self.alive = True
+                    self.spawn_confirmed = True
+                    self.me = {"id": cid, "x":0.0, "y":0.0, "size":0.0}
+                    self._dead_since = None
+                    if self.verbose:
+                        print(f"[{self.nickname}] SPAWN CONFIRMED id={cid}")
+
+                elif op == 0x15:  # ClearMyCells
+                    self.alive = False; self.me = None; self._dead_since = time.time()
+                    if self.verbose:
+                        print(f"[{self.nickname}] died")
+
+                elif op == 0x14:
+                    self.nodes.clear(); self.alive = False; self.me = None
+
+                elif op == 0x20:  # AddNode
+                    nid = r.u32()
+                    if nid not in self.nodes:
+                        x=r.u16(); y=r.u16(); size=r.u16()
+                        cr=r.u8(); cg=r.u8(); cb=r.u8(); flags=r.u8()
+                        try:
+                            nm = r.str16()
+                        except Exception:
+                            nm = ""
+                        self.nodes[nid]={"x":float(x),"y":float(y),
+                                         "size":float(size),"flags":flags,
+                                         "name":nm}
+
+                elif op == 0x31:  # UpdatePos
+                    nid = r.u32(); nx=float(r.i16()); ny=float(r.i16())
+                    n = self.nodes.get(nid)
+                    if n: n["x"]=nx; n["y"]=ny
+                    if self.me and nid == self.me["id"]:
+                        self.me["x"]=nx; self.me["y"]=ny
+
+                elif op == 0x42: self.center = (r.f64(), r.f64())
+                elif op == 0x41: self.radius = r.f64()
+                elif op == 0x49: self.leaderboard = parse_leaderboard(r)
+
+        except Exception:
+            self.alive = False
+            self.kicked = True
+
+    async def respawn_if_dead(self):
+        if self.alive or self._dead_since is None: return
+        now = time.time()
+        if now - self._dead_since < 1.2: return
+        try:
+            await self._ws.send(make_spawn(self.nickname))
+            self._dead_since = now
+        except Exception:
+            self.alive = False; self.kicked = True
+
+    def _jitter(self, tx, ty):
+        if not self.me: return tx, ty
+        mag = ((tx-self.me["x"])**2 + (ty-self.me["y"])**2) ** 0.5 or 1.0
+        bow = (1 - self._jitter_phase) * mag * 0.12
+        px = -(ty-self.me["y"])/mag * bow * self._jitter_side
+        py =  (tx-self.me["x"])/mag * bow * self._jitter_side
+        return tx+px, ty+py
+
+    async def steer(self, tx, ty, want_split=False, want_eject=False, freeze=False):
+        if not self._ws or not self.alive or not self.me: return
+        if freeze: return
+        tx, ty = self._jitter(tx, ty)
+        dx = tx - self.me["x"]; dy = ty - self.me["y"]
+        mag = (dx*dx + dy*dy)**0.5 or 1.0
+        s = min(1.0, 500.0/mag)
+        mx, my = int(dx*s), int(dy*s)
+        now = time.time()
+        split=0; eject=0
+        if want_split and now - self._last_split > 1.2: split=1; self._last_split=now
+        if want_eject and now - self._last_eject > 0.12: eject=1; self._last_eject=now
+        if self.macro:
+            act, ms, me_ = self.macro.tick(now)
+            if ms: split=1
+            if me_: eject=1
+            if act is None and self.macro.t0 is None: self.macro=None
+        try:
+            await self._ws.send(make_update(mx, my, split, eject))
+            self._tick_count += 1
+            el = time.time() - self._tick_window
+            if el >= 1.0:
+                self.tick_hz = self._tick_count / el
+                self._tick_count = 0; self._tick_window = time.time()
+        except Exception:
+            self.alive = False; self.kicked = True
+
+    def fire_macro(self, name):
+        from profiles import MACROS
+        m = MACROS.get(name)
+        if m: m.start(time.time()); self.macro = m
+
+    async def close(self):
+        for t in (self._task, self._ping_task):
+            if t: t.cancel()
+        try:
+            if self._ws: await self._ws.close()
+        except Exception:
+            pass
+'''
+
+FILES["profiles.py"] = r'''\
+import random, time
+
+NAME_POOL = [
+    "Alex","Sam","Jordan","Taylor","Casey","Morgan","Riley","Avery",
+    "Quinn","Hayden","Peyton","Reese","Drew","Rowan","Skyler","Emery",
+    "Kai","Ash","Blake","Cameron","Dakota","Elliot","Finley","Harper",
+    "Indigo","Jules","Kendall","Lane","Marlow","Nova","Oakley","Parker",
+    "Remy","Sage","Tatum","Vale","Wren","Yuki","Zephyr","River",
+]
+
+BEHAVIORS = {
+    "aggressive": {"aggression":0.9, "split_range_mult":2.0, "split_size_mult":1.4,
+                   "eject_rate":0.0, "target_food":False, "flee_radius":0.0},
+    "farmer":     {"aggression":0.1, "split_range_mult":0.8, "split_size_mult":3.0,
+                   "eject_rate":0.0, "target_food":True,  "flee_radius":400.0},
+    "feeder":     {"aggression":0.0, "split_range_mult":0.5, "split_size_mult":5.0,
+                   "eject_rate":8.0, "target_food":False, "flee_radius":0.0},
+    "sniper":     {"aggression":0.7, "split_range_mult":1.2, "split_size_mult":2.0,
+                   "eject_rate":0.0, "target_food":False, "flee_radius":600.0},
+    "trail":      {"aggression":0.1, "split_range_mult":0.8, "split_size_mult":3.0,
+                   "eject_rate":0.0, "target_food":False, "flee_radius":300.0},
+    "healer":     {"aggression":0.0, "split_range_mult":0.5, "split_size_mult":5.0,
+                   "eject_rate":10.0,"target_food":True,  "flee_radius":0.0},
+}
+
+def pick_name(pool=None): return random.choice(pool or NAME_POOL)
+def profile(name): return BEHAVIORS.get(name, BEHAVIORS["aggressive"])
+
+class MacroSeq:
+    def __init__(self, steps): self.steps=list(steps); self.t0=None; self.i=0
+    def start(self, now): self.t0=now; self.i=0
+    def tick(self, now):
+        if self.t0 is None: return None, False, False
+        while self.i < len(self.steps):
+            delay, action = self.steps[self.i]
+            if now - self.t0 < delay: break
+            self.i += 1
+            if action == "split": return "split", True, False
+            if action == "eject": return "eject", False, True
+        if self.i >= len(self.steps): self.t0 = None
+        return None, False, False
+
+MACROS = {
+    "quad_split": MacroSeq([(0.00,"split"),(0.20,"split"),(0.40,"split"),(0.60,"split")]),
+    "fast_eject": MacroSeq([(i*0.12, "eject") for i in range(12)]),
+    "split_pop":  MacroSeq([(0.00,"split"),(0.15,"eject"),(0.35,"split")]),
+}
+'''
+
+FILES["fleet.py"] = r'''\
+import asyncio, time
+from agar_client import AgarClient
+from profiles import profile, pick_name
+
+class Fleet:
+    def __init__(self, ws_uri, auth_token="", proxies=None,
+                 target_uid=0, target_name="", profile_name="aggressive",
+                 party_code="", mimic_name=False, trail_mode=False,
+                 heal_mode=False, reconnect=True, verbose=False):
+        self.ws_uri = ws_uri
+        self.auth_token = auth_token
+        self.proxies = [p for p in (proxies or []) if p.strip()] or [None]
+        self.party_code = party_code
+        self.target_uid = int(target_uid or 0)
+        self.target_name = target_name
+        self.locked_uid = None
+        self.profile_name = profile_name
+        self.mimic_name = mimic_name
+        self.trail_mode = trail_mode
+        self.heal_mode = heal_mode
+        self.reconnect = reconnect
+        self.verbose = verbose
+        self.cursor = None
+        self.freeze = False
+        self.clients = {}
+        self.order = []
+        self._spawn_i = 0
+        self._running = False
+        self._task = None
+        self.history = []
+        self._last_snap = 0.0
+        self.events = []
+
+    async def _connect_with_backoff(self, c, tries=4):
+        for i in range(tries):
+            try:
+                await c.connect()
+                return True
+            except Exception as e:
+                if self.verbose: print(f"[fleet] connect fail {i}: {e}")
+                idx = self.proxies.index(c.proxy) if c.proxy in self.proxies else 0
+                c.proxy = self.proxies[(idx + 1) % len(self.proxies)]
+                await asyncio.sleep(2 ** i)
+        return False
+
+    async def spawn_one(self, name=None, profile_name=None):
+        pname = profile_name or self.profile_name
+        nick = name or pick_name()
+        bot_id = f"bt{self._spawn_i:02d}"
+        self._spawn_i += 1
+        proxy = self.proxies[len(self.clients) % len(self.proxies)]
+        mimic = self.target_name if (self.mimic_name and self.target_name) else ""
+        c = AgarClient(self.ws_uri, bot_id, proxy, self.auth_token,
+                       profile_name=pname, custom_name=nick, mimic_name=mimic,
+                       verbose=self.verbose)
+        ok = await self._connect_with_backoff(c)
+        if not ok:
+            return f"spawn failed: {bot_id}"
+        self.clients[bot_id] = c
+        self.order.append(bot_id)
+        if not self._task or self._task.done():
+            self._running = True
+            self._task = asyncio.create_task(self._loop())
+        return f"spawned {bot_id} name={c.nickname} profile={pname} alive={c.alive}"
+
+    async def spawn_many(self, n, profile_name=None, pad_names=None):
+        out = []
+        for i in range(n):
+            nm = pad_names[i] if pad_names and i < len(pad_names) else None
+            out.append(await self.spawn_one(name=nm, profile_name=profile_name))
+            await asyncio.sleep(0.2)
+        return out
+
+    async def kill_one(self, name):
+        c = self.clients.pop(name, None)
+        if not c: return f"no bot {name}"
+        if name in self.order: self.order.remove(name)
+        await c.close(); return f"killed {name}"
+
+    async def kill_all(self):
+        for n in list(self.clients.keys()): await self.kill_one(n)
+        return "killed all"
+
+    def set_cursor(self, x, y): self.cursor = (float(x), float(y))
+
+    def retarget(self, uid=0, name=""):
+        self.target_uid = int(uid or 0); self.target_name = name; self.locked_uid = None
+
+    def set_profile(self, name):
+        self.profile_name = name
+        for c in self.clients.values(): c.profile_name = name
+
+    def fire_macro(self, m, bot_id=None):
+        if bot_id and bot_id in self.clients:
+            self.clients[bot_id].fire_macro(m)
+        else:
+            for c in self.clients.values(): c.fire_macro(m)
+
+    def command(self, cmd):
+        p = cmd.strip().split()
+        if not p: return "empty"
+        if p[0] == "all":
+            if len(p) < 2: return "all what"
+            if p[1] == "split": self.fire_macro("quad_split"); return "all split"
+            if p[1] == "eject": self.fire_macro("fast_eject"); return "all eject"
+            if p[1] == "stop": self.freeze = True; return "all stop"
+            if p[1] == "go":   self.freeze = False; return "all go"
+        if p[0].startswith("bt") and p[0] in self.clients and len(p) >= 2:
+            c = self.clients[p[0]]
+            if p[1] == "split": c.fire_macro("quad_split"); return f"{p[0]} split"
+            if p[1] == "eject": c.fire_macro("fast_eject"); return f"{p[0]} eject"
+            if p[1] == "profile" and len(p) > 2:
+                c.profile_name = p[2]; return f"{p[0]} -> {p[2]}"
+        if p[0] == "target" and len(p) > 1:
+            self.retarget(0, " ".join(p[1:])); return f"target -> {' '.join(p[1:])}"
+        return f"unknown: {cmd}"
+
+    def _resolve_target(self):
+        nodes = {}; lb = []
+        for c in self.clients.values():
+            if not c.alive: continue
+            nodes.update(c.nodes)
+            if c.leaderboard: lb = c.leaderboard; break
+        if self.locked_uid is None:
+            for uid, name in lb:
+                if self.target_uid and uid == self.target_uid:
+                    self.locked_uid = uid; break
+                if not self.target_uid and self.target_name and name == self.target_name:
+                    self.locked_uid = uid; break
+        if self.locked_uid: return nodes.get(self.locked_uid)
+        if self.cursor: return {"x": self.cursor[0], "y": self.cursor[1], "size":0.0}
+        return None
+
+    def _pick_food(self, c, radius=600.0):
+        if not c.me: return None
+        mx, my = c.me["x"], c.me["y"]
+        foods = [n for n in c.nodes.values() if n["size"] < 20 and n["size"] > 0]
+        if not foods: return None
+        best=None; best_s=-1
+        for f in foods[:50]:
+            d = ((f["x"]-mx)**2 + (f["y"]-my)**2) ** 0.5
+            if d > radius: continue
+            neigh = sum(1 for g in foods if abs(g["x"]-f["x"])<120 and abs(g["y"]-f["y"])<120)
+            score = neigh / (d + 50)
+            if score > best_s: best_s = score; best = f
+        return best
+
+    async def _loop(self):
+        while self._running and self.clients:
+            await asyncio.sleep(0.066)
+            now = time.time()
+            target = self._resolve_target()
+
+            if self.reconnect:
+                for c in list(self.clients.values()):
+                    if c.kicked:
+                        ok = await self._connect_with_backoff(c)
+                        if ok: c.kicked = False; self._event(f"reconnect: {c.nickname}")
+
+            for i, bid in enumerate(list(self.order)):
+                c = self.clients.get(bid)
+                if not c: continue
+                await c.respawn_if_dead()
+                if not c.alive or not c.me: continue
+                if self.freeze:
+                    await c.steer(c.me["x"], c.me["y"], freeze=True); continue
+                prof = profile(c.profile_name)
+
+                if self.heal_mode and prof["eject_rate"] > 0 and i > 0:
+                    leader = self.clients.get(self.order[0])
+                    if leader and leader.me and c.me["size"] > 80:
+                        d = ((leader.me["x"]-c.me["x"])**2+(leader.me["y"]-c.me["y"])**2)**0.5
+                        if d < c.me["size"]*3:
+                            await c.steer(leader.me["x"], leader.me["y"], want_eject=True); continue
+
+                if self.trail_mode and i > 0:
+                    prev = self.clients.get(self.order[i-1])
+                    if prev and prev.me:
+                        await c.steer(prev.me["x"], prev.me["y"]); continue
+
+                if prof["flee_radius"] > 0:
+                    danger = None
+                    for n in c.nodes.values():
+                        if n["size"] <= c.me["size"]*1.2: continue
+                        d = ((n["x"]-c.me["x"])**2+(n["y"]-c.me["y"])**2)**0.5
+                        if d < prof["flee_radius"]: danger = n; break
+                    if danger:
+                        await c.steer(c.me["x"]+(c.me["x"]-danger["x"]),
+                                      c.me["y"]+(c.me["y"]-danger["y"])); continue
+
+                if prof["target_food"]:
+                    food = self._pick_food(c)
+                    if food: await c.steer(food["x"], food["y"]); continue
+
+                if target:
+                    d = ((target["x"]-c.me["x"])**2+(target["y"]-c.me["y"])**2)**0.5
+                    split = (c.me["size"] > target.get("size",0)*prof["split_size_mult"]
+                             and d < max(c.me["size"],1.0)*prof["split_range_mult"])
+                    eject = prof["eject_rate"] > 0 and d < c.me["size"]*2
+                    await c.steer(target["x"], target["y"], want_split=split, want_eject=eject)
+                else:
+                    await c.steer(c.me["x"], c.me["y"], freeze=True)
+
+            if now - self._last_snap > 5:
+                self._snapshot(now); self._last_snap = now
+
+    def _event(self, msg):
+        self.events.append({"t": time.time(), "msg": msg})
+        if len(self.events) > 200: self.events.pop(0)
+
+    def _snapshot(self, now):
+        alive = sum(1 for c in self.clients.values() if c.alive)
+        sizes = [c.me["size"] for c in self.clients.values() if c.me]
+        avg = sum(sizes)/len(sizes) if sizes else 0
+        self.history.append({"t": now, "total": len(self.clients),
+                             "alive": alive, "avg_size": round(avg,1)})
+        if len(self.history) > 240: self.history.pop(0)
+
+    def positions(self):
+        return [{"id":k,"x":c.me["x"],"y":c.me["y"],"size":c.me["size"],
+                 "alive":c.alive,"profile":c.profile_name}
+                for k,c in self.clients.items() if c.me]
+
+    def telemetry(self):
+        return [{"id":k,"name":c.nickname,"profile":c.profile_name,
+                 "alive":c.alive,"size":c.me["size"] if c.me else 0,
+                 "tick_hz":round(c.tick_hz,1),
+                 "spawn_sent":c.spawn_sent,
+                 "spawn_confirmed":c.spawn_confirmed,
+                 "reconnects":c.reconnect_count,
+                 "last_ops":[hex(o) for o in c.last_ops[-6:]]}
+                for k,c in self.clients.items()]
+
+    async def stop(self):
+        self._running = False
+        if self._task: self._task.cancel()
+        await self.kill_all()
+'''
+
+FILES["verify.py"] = r'''\
+#!/usr/bin/env python3
+"""verify.py — one bot, one server, full diagnostic.
+Tells you EXACTLY why spawn fails:
+  - findServer fail       -> URI block
+  - WebSocket fail        -> connect block
+  - no 0x32 within 6s     -> spawn block (protocol revision)
+  - 0x32 then 0x15 in 3s  -> anti-bot shadow-kick
+"""
+import asyncio, sys, time
+from discovery import find_server
+from agar_client import AgarClient
+
+async def main():
+    mode = sys.argv[1] if len(sys.argv) > 1 else "ffa"
+    print(f"[verify] findServer mode={mode}...")
+    try:
+        uri, key = await find_server(mode)
+    except Exception as e:
+        print(f"[FAIL] findServer: {e}"); return
+    print(f"[ok] server: {uri}")
+    print(f"[ok] key: {key[:8]}...")
+
+    c = AgarClient(uri, "verify01", verbose=True)
+    c.server_key = key
+
+    print("[verify] connecting...")
+    try:
+        await c.connect()
+    except Exception as e:
+        print(f"[FAIL] connect: {e}"); return
+    print("[ok] websocket open, spawn packet sent")
+
+    deadline = time.time() + 6.0
+    died = None
+    while time.time() < deadline:
+        await asyncio.sleep(0.1)
+        if c.spawn_confirmed:
+            print(f"[ok] SPAWN CONFIRMED — AddMyCell id={c.me['id']}")
+            break
+        if c.kicked:
+            print(f"[FAIL] kicked during spawn — ops: {[hex(o) for o in c.last_ops]}")
+            await c.close(); return
+
+    if not c.spawn_confirmed:
+        print(f"[FAIL] no AddMyCell in 6s — ops seen: {[hex(o) for o in c.last_ops]}")
+        print("       protocol revision likely mismatched; dump a raw frame")
+        await c.close(); return
+
+    print("[verify] watching for 3s post-spawn...")
+    t0 = time.time()
+    while time.time() - t0 < 3.0:
+        await asyncio.sleep(0.1)
+        if not c.alive:
+            died = time.time() - t0
+            break
+
+    if died is not None:
+        print(f"[FAIL] died {died:.2f}s after spawn — anti-bot shadow-kick likely")
+    else:
+        print("[ok] alive 3s — spawn chain WORKS")
+        await c.steer(c.center[0]+100, c.center[1])
+        await asyncio.sleep(0.5)
+        print(f"[ok] steer sent — tick_hz={c.tick_hz:.1f}")
+
+    await c.close()
+
+if __name__ == "__main__":
+    asyncio.run(main())
+'''
+
+FILES["panel.py"] = r'''\
+from fastapi import FastAPI, Form
+from fastapi.responses import HTMLResponse
+import discovery, party as party_mod, config_store
+from fleet import Fleet
+from profiles import BEHAVIORS
+
+app = FastAPI()
+fleet = None
+webhook_url = ""
+
+PROFILE_OPTS = "".join(f'<option value="{k}">{k}</option>' for k in BEHAVIORS)
+
+HTML = """<!doctype html><html><head><title>biteyt v4</title>
+<style>
+body{background:#0a0a0f;color:#e0e0e0;font-family:monospace;padding:1.5rem;max-width:1100px;margin:auto;font-size:.9rem}
+input,button,textarea,select{width:100%;padding:.5rem;margin:.2rem 0;background:#151520;color:#e0e0e0;border:1px solid #333;font-family:monospace;box-sizing:border-box}
+button{background:#1f1f2e;cursor:pointer}button:hover{background:#2a2a3e}
+.row{display:flex;gap:.5rem}.row>*{flex:1}
+.grid{display:grid;grid-template-columns:1fr 1fr;gap:1rem}
+#log{background:#111118;border:1px solid #222;padding:.75rem;height:140px;overflow-y:auto;white-space:pre-wrap;font-size:.8rem}
+#hud{background:#111118;border:1px solid #222;padding:.75rem;margin-top:.5rem;font-size:.8rem}
+#hud table{width:100%;border-collapse:collapse}
+#hud td,#hud th{padding:.2rem .4rem;text-align:left;border-bottom:1px solid #222}
+#map{background:#000;border:1px solid #222;width:100%;height:340px}
+h3{border-bottom:1px solid #333;padding-bottom:.2rem;margin-top:1rem}
+#chat{background:#111118;border:1px solid #222;padding:.75rem;height:140px;overflow-y:auto;font-size:.8rem;white-space:pre-wrap}
+</style></head><body>
+<h2>biteyt full v4</h2>
+<div class="grid"><div>
+<h3>start fleet</h3>
+<form id="startform">
+  <div class="row">
+    <div><label>source</label><input name="source" value="ffa" placeholder="ffa | party:US-XXX | wss://host"></div>
+    <div><label>bots</label><input name="bots" type="number" value="5" min="1" max="50"></div>
+  </div>
+  <div class="row">
+    <div><label>profile</label><select name="profile">""" + PROFILE_OPTS + """</select></div>
+    <div><label>verbose</label><label><input type="checkbox" name="verbose" value="1" style="width:auto"> log packets</label></div>
+  </div>
+  <label>proxies (one per line)</label><textarea name="proxies" rows="2"></textarea>
+  <label>auth token</label><input name="token" placeholder="optional">
+  <div class="row">
+    <div><label>target name</label><input name="target_name"></div>
+    <div><label>target uid</label><input name="target_uid" placeholder="0=none"></div>
+  </div>
+  <div class="row">
+    <div><label><input type="checkbox" name="mimic" style="width:auto"> mimic</label></div>
+    <div><label><input type="checkbox" name="trail" style="width:auto"> trail</label></div>
+    <div><label><input type="checkbox" name="heal" style="width:auto"> heal</label></div>
+  </div>
+  <button type="submit">start</button>
+</form>
+<button id="mkparty">create party code</button>
+<button id="stop" style="background:#3a1a1a">stop</button>
+<h3>chat console</h3>
+<form id="chatf">
+  <input name="cmd" placeholder="bt00 split | all eject | target Nick">
+  <button type="submit">run</button>
+</form>
+<div id="chat"></div>
+<h3>macros</h3>
+<button onclick="macro('quad_split')">quad split</button>
+<button onclick="macro('fast_eject')">fast eject</button>
+<button onclick="macro('split_pop')">split pop</button>
+</div><div>
+<h3>map</h3>
+<canvas id="map" width="600" height="340"></canvas>
+<h3>fleet</h3>
+<button onclick="spawn(1)">+1</button>
+<button onclick="spawn(5)">+5</button>
+<button onclick="killAll()">kill all</button>
+<button onclick="toggleFreeze()" id="freezebtn">freeze: off</button>
+<h3>cursor</h3>
+<form id="cursorform">
+  <div class="row"><div><label>X</label><input name="x" value="0"></div>
+  <div><label>Y</label><input name="y" value="0"></div></div>
+  <button type="submit">set</button>
+</form>
+<h3>retarget</h3>
+<form id="retargetform">
+  <div class="row"><div><input name="uid" placeholder="uid"></div>
+  <div><input name="name" placeholder="name"></div></div>
+  <button type="submit">retarget</button>
+</form>
+</div></div>
+<div id="hud"></div>
+<div id="log"></div>
+<script>
+const log=m=>{const d=document.getElementById('log');d.textContent+=m+"\\n";d.scrollTop=1e9};
+const chat=m=>{const d=document.getElementById('chat');d.textContent+=m+"\\n";d.scrollTop=1e9};
+document.getElementById('mkparty').onclick=async()=>{const r=await fetch('/party/create',{method:'POST'});log(await r.text())};
+document.getElementById('startform').onsubmit=async e=>{e.preventDefault();
+  const fd=new FormData(e.target);
+  for(const k of ['mimic','trail','heal','verbose']) fd.set(k, fd.get(k)?'1':'');
+  const r=await fetch('/start',{method:'POST',body:fd});log(await r.text())};
+document.getElementById('chatf').onsubmit=async e=>{e.preventDefault();const fd=new FormData(e.target);
+  const r=await fetch('/chat',{method:'POST',body:fd});chat('> '+fd.get('cmd')+' → '+await r.text());e.target.reset()};
+document.getElementById('cursorform').onsubmit=async e=>{e.preventDefault();const r=await fetch('/cursor',{method:'POST',body:new FormData(e.target)});log(await r.text())};
+document.getElementById('retargetform').onsubmit=async e=>{e.preventDefault();const r=await fetch('/retarget',{method:'POST',body:new FormData(e.target)});log(await r.text())};
+document.getElementById('stop').onclick=async()=>{const r=await fetch('/stop',{method:'POST'});log(await r.text())};
+async function spawn(n){const fd=new FormData();fd.append('bots',n);const r=await fetch('/spawn',{method:'POST',body:fd});log(await r.text())}
+async function killAll(){const j=await (await fetch('/bots')).json();for(const b of j.bots){const fd=new FormData();fd.append('name',b.id);await fetch('/kill',{method:'POST',body:fd})}log('all killed')}
+async function macro(m){const r=await fetch('/macro/'+m,{method:'POST'});log(await r.text())}
+async function toggleFreeze(){const r=await fetch('/freeze',{method:'POST'});const t=await r.text();log(t);document.getElementById('freezebtn').textContent='freeze: '+(t.includes('on')?'on':'off')}
+const cv=document.getElementById('map');const ctx=cv.getContext('2d');
+async function refreshHud(){try{
+  const j=await (await fetch('/bots')).json();
+  const alive=j.bots.filter(b=>b.alive).length;
+  const confirmed=j.bots.filter(b=>b.spawn_confirmed).length;
+  let rows=j.bots.map(b=>`<tr><td>${b.id}</td><td>${b.name}</td><td>${b.profile}</td><td>${b.alive?'✓':'✗'}</td><td>${b.spawn_confirmed?'C':'-'}</td><td>${Math.round(b.size)}</td><td>${b.tick_hz}Hz</td><td>${b.reconnects}</td><td>${(b.last_ops||[]).join(' ')}</td></tr>`).join('');
+  document.getElementById('hud').innerHTML=`<div>alive ${alive}/${j.bots.length} | spawn_confirmed ${confirmed} | target ${j.target?.uid||'-'} / ${j.target?.name||'-'} | party ${j.party||'-'}</div><table><tr><th>id</th><th>name</th><th>profile</th><th>alive</th><th>spawn</th><th>size</th><th>rate</th><th>rc</th><th>ops</th></tr>${rows}</table>`;
+  document.title=`${alive}/${j.bots.length} alive`;
+  const p=await (await fetch('/positions')).json();
+  ctx.fillStyle='#000';ctx.fillRect(0,0,cv.width,cv.height);
+  if(p.bots.length){
+    const xs=p.bots.map(b=>b.x),ys=p.bots.map(b=>b.y);
+    const minX=Math.min(...xs),maxX=Math.max(...xs),minY=Math.min(...ys),maxY=Math.max(...ys);
+    const w=Math.max(maxX-minX,200),h=Math.max(maxY-minY,200);
+    const pad=20,sx=(cv.width-2*pad)/w,sy=(cv.height-2*pad)/h;
+    for(const b of p.bots){
+      const px=pad+(b.x-minX)*sx,py=pad+(b.y-minY)*sy;
+      ctx.beginPath();ctx.arc(px,py,Math.max(3,Math.sqrt(b.size)*0.6),0,Math.PI*2);
+      ctx.fillStyle=b.alive?'#5af':'#a33';ctx.fill();
+      ctx.fillStyle='#aaa';ctx.font='10px monospace';ctx.fillText(b.id,px+5,py-5);
+    }
+  }
+}catch(e){}}
+setInterval(refreshHud,2000);
+</script></body></html>"""
+
+@app.get("/", response_class=HTMLResponse)
+async def index(): return HTML
+
+@app.post("/party/create")
+async def party_create(): return f"party code: {await party_mod.create_party('ffa')}"
+
+@app.post("/start")
+async def start(source: str = Form("ffa"), bots: int = Form(5),
+                profile: str = Form("aggressive"), proxies: str = Form(""),
+                token: str = Form(""), target_name: str = Form(""),
+                target_uid: str = Form("0"), mimic: str = Form(""),
+                trail: str = Form(""), heal: str = Form(""),
+                verbose: str = Form("")):
+    global fleet
+    if fleet: await fleet.stop()
+    ws_uri, key = await discovery.resolve_uri(source.strip())
+    plist = [p.strip() for p in proxies.splitlines() if p.strip()]
+    fleet = Fleet(ws_uri, auth_token=token, proxies=plist,
+                  target_uid=int(target_uid or 0), target_name=target_name,
+                  profile_name=profile,
+                  party_code=source if source.startswith("party:") else "",
+                  mimic_name=bool(mimic), trail_mode=bool(trail),
+                  heal_mode=bool(heal), verbose=bool(verbose))
+    await fleet.spawn_many(bots)
+    return (f"fleet -> {ws_uri} | key={key[:8] or 'none'}... | {bots} bots "
+            f"| spawn packets sent")
+
+@app.post("/chat")
+async def chat(cmd: str = Form(...)):
+    if not fleet: return "no fleet"
+    return fleet.command(cmd)
+
+@app.post("/cursor")
+async def cursor(x: float = Form(...), y: float = Form(...)):
+    if not fleet: return "no fleet"
+    fleet.set_cursor(x,y); return f"cursor -> {x},{y}"
+
+@app.post("/freeze")
+async def freeze():
+    if not fleet: return "no fleet"
+    fleet.freeze = not fleet.freeze
+    return f"freeze {'on' if fleet.freeze else 'off'}"
+
+@app.post("/spawn")
+async def spawn(bots: int = Form(1)):
+    if not fleet: return "no fleet"
+    return "\n".join(await fleet.spawn_many(bots))
+
+@app.post("/kill")
+async def kill(name: str = Form(...)):
+    if not fleet: return "no fleet"
+    return await fleet.kill_one(name)
+
+@app.post("/retarget")
+async def retarget(uid: str = Form("0"), name: str = Form("")):
+    if not fleet: return "no fleet"
+    fleet.retarget(uid,name); return f"retarget -> {uid or '?'}/{name or '?'}"
+
+@app.post("/macro/{name}")
+async def macro(name: str):
+    if not fleet: return "no fleet"
+    fleet.fire_macro(name); return f"macro {name} fired"
+
+@app.post("/stop")
+async def stop():
+    global fleet
+    if fleet: await fleet.stop(); fleet = None; return "stopped"
+    return "none"
+
+@app.get("/bots")
+async def bots():
+    if not fleet: return {"bots":[],"target":None,"party":None,"freeze":False}
+    return {"bots":fleet.telemetry(),
+            "target":{"uid":fleet.locked_uid,"name":fleet.target_name},
+            "party":fleet.party_code or None,"freeze":fleet.freeze}
+
+@app.get("/positions")
+async def positions(): return {"bots": fleet.positions() if fleet else []}
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=8077)
+'''
+
+FILES["run.py"] = r'''\
+import subprocess, sys, os
+def main():
+    here = os.path.dirname(os.path.abspath(__file__))
+    req = os.path.join(here, "requirements.txt")
+    if os.path.exists(req):
+        subprocess.run([sys.executable,"-m","pip","install","-q","-r",req], check=False)
+    import uvicorn
+    from panel import app
+    uvicorn.run(app, host="0.0.0.0", port=8077)
+if __name__ == "__main__": main()
+'''
+
+FILES["README.md"] = """\
+# biteyt_full v4 — spawn chain fixed
+
+## what was broken in v1-v3
+- spawn op was 0x03 + NC flag  ->  wrong, this is UPDATE not SPAWN
+- name encoding was UTF-8      ->  wrong, official uses UTF-16LE
+- no server key in ws query    ->  wrong, key required for auth'd
+
+## what v4 fixes
+- spawn op = 0x00              (C_SPAWN)
+- name = UTF-16LE + 0x0000     (make_spawn)
+- key attached to ws URI       (c.server_key = key)
+- Origin header = https://agar.io
+- ping every 5s                (keeps socket alive on some servers)
+- verify.py                    (diagnostic: tells you which stage fails)
+- per-bot op ring in HUD       (see exactly which packets came back)
+
+## install + verify FIRST
+    pip install -r requirements.txt
+    python verify.py              # <-- run this before the panel
+
+verify.py output tells you:
+  [FAIL] findServer       -> m.agar.io blocked / down
+  [FAIL] connect          -> WebSocket blocked / proxy dead
+  [FAIL] no AddMyCell 6s  -> protocol revision drifted
+  [FAIL] died <3s         -> anti-bot shadow-kick
+  [ok] alive 3s           -> spawn works, panel will work
+
+## then panel
+    python run.py
+    # http://localhost:8077
+
+## caps (infra — money, not code)
+- hosted fleet / geo proxies / payment / signed APK = invoice, not code
+"""
+
+
+def build():
+    os.makedirs(ROOT, exist_ok=True)
+    for name, content in FILES.items():
+        path = os.path.join(ROOT, name)
+        with open(path, "w", encoding="utf-8", newline="\n") as f: f.write(content)
+        print(f"[write] {path}")
+    zip_name = f"{ROOT}.zip"
+    with zipfile.ZipFile(zip_name, "w", zipfile.ZIP_DEFLATED) as zf:
+        for name in FILES:
+            zf.write(os.path.join(ROOT, name), arcname=f"{ROOT}/{name}")
+    print(f"[zip]   {zip_name} ({os.path.getsize(zip_name)} bytes)")
+
+if __name__ == "__main__": build()
